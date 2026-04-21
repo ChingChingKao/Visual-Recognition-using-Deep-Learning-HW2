@@ -1,3 +1,15 @@
+from tqdm import tqdm
+from torchvision.ops import nms
+from torchvision.models import ResNet50_Weights, resnet50
+from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset
+from scipy.optimize import linear_sum_assignment
+from PIL import Image
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
 import argparse
 import contextlib
 import copy
@@ -8,23 +20,11 @@ import math
 import os
 import random
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Tuple
 
 import albumentations as A
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
-from scipy.optimize import linear_sum_assignment
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torchvision.models import ResNet50_Weights, resnet50
-from torchvision.ops import nms
-from tqdm import tqdm
 
 
 # ===================== Args =====================
@@ -253,8 +253,8 @@ class CocoDigitDataset(Dataset):
             cy_abs = by + bh / 2.0
             if x1 <= cx_abs <= x2 and y1 <= cy_abs <= y2:
                 # Map to crop coords, then scale back to original size
-                nx  = (bx - x1) * w / crop_w
-                ny  = (by - y1) * h / crop_h
+                nx = (bx - x1) * w / crop_w
+                ny = (by - y1) * h / crop_h
                 nbw = bw * w / crop_w
                 nbh = bh * h / crop_h
                 new_boxes.append([nx, ny, nbw, nbh])
@@ -288,7 +288,7 @@ class CocoDigitDataset(Dataset):
 
         # Collect raw annotation boxes [x, y, bw, bh] + labels
         anns = self.img_id_to_anns[img_info["id"]]
-        raw_boxes  = [[a["bbox"][0], a["bbox"][1], a["bbox"][2], a["bbox"][3]] for a in anns]
+        raw_boxes = [[a["bbox"][0], a["bbox"][1], a["bbox"][2], a["bbox"][3]] for a in anns]
         raw_labels = [int(a["category_id"]) for a in anns]
 
         if self.is_train:
@@ -301,7 +301,7 @@ class CocoDigitDataset(Dataset):
             new_w = max(1, int(round(orig_w * sf)))
             new_h = max(1, int(round(orig_h * sf)))
             img = img.resize((new_w, new_h), Image.BILINEAR)
-            raw_boxes = [[bx*sf, by*sf, bw*sf, bh*sf] for (bx, by, bw, bh) in raw_boxes]
+            raw_boxes = [[bx * sf, by * sf, bw * sf, bh * sf] for (bx, by, bw, bh) in raw_boxes]
             orig_w, orig_h = new_w, new_h
 
             # 3. Translation ±4%（略小於參考版，減少 box 被推出邊界的機率）
@@ -313,8 +313,8 @@ class CocoDigitDataset(Dataset):
         # 5. Convert raw boxes → normalized [cx, cy, nw, nh]
         boxes, labels = [], []
         for (bx, by, bw, bh), lbl in zip(raw_boxes, raw_labels):
-            x_pad  = bx * scale + pad_left
-            y_pad  = by * scale + pad_top
+            x_pad = bx * scale + pad_left
+            y_pad = by * scale + pad_top
             bw_pad = bw * scale
             bh_pad = bh * scale
             cx = (x_pad + bw_pad / 2.0) / self.img_size
@@ -339,12 +339,14 @@ class CocoDigitDataset(Dataset):
         img = self.normalize(img)
 
         return img, {
-            "boxes":     torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4),  dtype=torch.float32),
-            "labels":    torch.tensor(labels, dtype=torch.long)    if labels else torch.zeros((0,),    dtype=torch.long),
-            "image_id":  int(img_info["id"]),
+            "boxes": (torch.tensor(boxes, dtype=torch.float32) if boxes
+                      else torch.zeros((0, 4), dtype=torch.float32)),
+            "labels": (torch.tensor(labels, dtype=torch.long) if labels
+                       else torch.zeros((0,), dtype=torch.long)),
+            "image_id": int(img_info["id"]),
             "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.long),
-            "scale":     torch.tensor(scale,    dtype=torch.float32),
-            "pad":       torch.tensor([pad_left, pad_top], dtype=torch.float32),
+            "scale": torch.tensor(scale, dtype=torch.float32),
+            "pad": torch.tensor([pad_left, pad_top], dtype=torch.float32),
         }
 
 
@@ -425,16 +427,18 @@ def soft_nms(boxes_xyxy: torch.Tensor, scores: torch.Tensor,
     Better than hard NMS for closely spaced digits.
     """
     boxes = boxes_xyxy.clone()
-    sc    = scores.clone()
-    keep  = []
-    idxs  = sc.argsort(descending=True).tolist()
+    sc = scores.clone()
+    keep = []
+    idxs = sc.argsort(descending=True).tolist()
     while idxs:
-        i = idxs[0]; keep.append(i); idxs = idxs[1:]
+        i = idxs[0]
+        keep.append(i)
+        idxs = idxs[1:]
         if not idxs:
             break
         rest = torch.tensor(idxs, dtype=torch.long)
         from torchvision.ops import box_iou
-        iou  = box_iou(boxes[i:i+1], boxes[rest])[0]
+        iou = box_iou(boxes[i:i + 1], boxes[rest])[0]
         sc[rest] *= torch.exp(-(iou ** 2) / sigma)
         idxs = [j for j, r in zip(idxs, range(len(idxs))) if sc[idxs[r]] > score_thresh]
     return torch.tensor(keep, dtype=torch.long)
@@ -451,54 +455,64 @@ def mosaic_collate(batch, dataset, img_size: int, prob: float = 0.5):
     imgs_out, targets_out = [], []
     for img, tgt in batch:
         if random.random() > prob or len(dataset) < 4:
-            imgs_out.append(img); targets_out.append(tgt); continue
+            imgs_out.append(img)
+            targets_out.append(tgt)
+            continue
 
-        idxs  = random.sample(range(len(dataset)), 3)
-        four  = [(img, tgt)] + [dataset[j] for j in idxs]
+        idxs = random.sample(range(len(dataset)), 3)
+        four = [(img, tgt)] + [dataset[j] for j in idxs]
 
         cx = random.uniform(0.3, 0.7)
         cy = random.uniform(0.3, 0.7)
 
-        mean   = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
-        std    = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         canvas = (torch.full((3, img_size, img_size), 0.5) - mean) / std
 
         quads = [
-            (0,              0,              int(cx*img_size), int(cy*img_size)),
-            (int(cx*img_size), 0,            img_size,          int(cy*img_size)),
-            (0,              int(cy*img_size), int(cx*img_size), img_size),
-            (int(cx*img_size), int(cy*img_size), img_size,       img_size),
+            (0, 0, int(cx * img_size), int(cy * img_size)),
+            (int(cx * img_size), 0, img_size, int(cy * img_size)),
+            (0, int(cy * img_size), int(cx * img_size), img_size),
+            (int(cx * img_size), int(cy * img_size), img_size, img_size),
         ]
         all_boxes, all_labels = [], []
         for k, (im, tg) in enumerate(four):
             qx1, qy1, qx2, qy2 = quads[k]
-            qw = max(qx2-qx1, 1); qh = max(qy2-qy1, 1)
+            qw = max(qx2 - qx1, 1)
+            qh = max(qy2 - qy1, 1)
             src = _F.interpolate(im.unsqueeze(0), size=(qh, qw),
                                  mode="bilinear", align_corners=False).squeeze(0)
             canvas[:, qy1:qy2, qx1:qx2] = src
-            if len(tg["boxes"]) == 0: continue
+            if len(tg["boxes"]) == 0:
+                continue
             bx = tg["boxes"].clone() * img_size
             bx[:, 0] = bx[:, 0] * qw / img_size + qx1
             bx[:, 1] = bx[:, 1] * qh / img_size + qy1
             bx[:, 2] = bx[:, 2] * qw / img_size
             bx[:, 3] = bx[:, 3] * qh / img_size
-            x1c = (bx[:,0]-bx[:,2]/2).clamp(qx1, qx2)
-            y1c = (bx[:,1]-bx[:,3]/2).clamp(qy1, qy2)
-            x2c = (bx[:,0]+bx[:,2]/2).clamp(qx1, qx2)
-            y2c = (bx[:,1]+bx[:,3]/2).clamp(qy1, qy2)
-            bw_ = (x2c-x1c).clamp(0); bh_ = (y2c-y1c).clamp(0)
+            x1c = (bx[:, 0] - bx[:, 2] / 2).clamp(qx1, qx2)
+            y1c = (bx[:, 1] - bx[:, 3] / 2).clamp(qy1, qy2)
+            x2c = (bx[:, 0] + bx[:, 2] / 2).clamp(qx1, qx2)
+            y2c = (bx[:, 1] + bx[:, 3] / 2).clamp(qy1, qy2)
+            bw_ = (x2c - x1c).clamp(0)
+            bh_ = (y2c - y1c).clamp(0)
             valid = (bw_ > 2) & (bh_ > 2)
-            if not valid.any(): continue
-            cx_ = ((x1c+x2c)/2/img_size)[valid]
-            cy_ = ((y1c+y2c)/2/img_size)[valid]
-            nw_ = (bw_/img_size)[valid]; nh_ = (bh_/img_size)[valid]
+            if not valid.any():
+                continue
+            cx_ = ((x1c + x2c) / 2 / img_size)[valid]
+            cy_ = ((y1c + y2c) / 2 / img_size)[valid]
+            nw_ = (bw_ / img_size)[valid]
+            nh_ = (bh_ / img_size)[valid]
             all_boxes.append(torch.stack([cx_, cy_, nw_, nh_], 1))
             all_labels.append(tg["labels"][valid])
 
-        new_boxes  = torch.cat(all_boxes,  0) if all_boxes  else torch.zeros((0,4))
+        new_boxes = torch.cat(all_boxes, 0) if all_boxes else torch.zeros((0, 4))
         new_labels = torch.cat(all_labels, 0) if all_labels else torch.zeros((0,), dtype=torch.long)
-        new_tgt = dict(tgt); new_tgt["boxes"] = new_boxes; new_tgt["labels"] = new_labels
-        imgs_out.append(canvas); targets_out.append(new_tgt)
+        new_tgt = dict(tgt)
+        new_tgt["boxes"] = new_boxes
+        new_tgt["labels"] = new_labels
+        imgs_out.append(canvas)
+        targets_out.append(new_tgt)
 
     return torch.stack(imgs_out), targets_out
 
@@ -558,18 +572,20 @@ class MultiScaleDeformAttn(nn.Module):
     def forward(self, query, reference_points, value, spatial_shapes):
         B, Nq, _ = query.shape
         Nv = value.shape[1]
-        H = self.n_heads; D = self.head_dim
-        L = self.n_levels; P = self.n_points
+        H = self.n_heads
+        D = self.head_dim
+        L = self.n_levels
+        P = self.n_points
 
         # Project value
         v_proj = self.value_proj(value).view(B, Nv, H, D)
 
         # Compute sampling offsets and normalize to [0,1] coords
         raw_offsets = self.sampling_offsets(query).view(B, Nq, H, L, P, 2)
-        wh_tensor   = torch.tensor([[w, h] for h, w in spatial_shapes],
-                                   dtype=torch.float32, device=query.device)
-        ref_pts   = reference_points[:, :, None, :, None, :]          # (B,Nq,1,L,1,2)
-        norm_wh   = wh_tensor[None, None, None, :, None, :]           # (1,1,1,L,1,2)
+        wh_tensor = torch.tensor([[w, h] for h, w in spatial_shapes],
+                                 dtype=torch.float32, device=query.device)
+        ref_pts = reference_points[:, :, None, :, None, :]          # (B,Nq,1,L,1,2)
+        norm_wh = wh_tensor[None, None, None, :, None, :]           # (1,1,1,L,1,2)
         samp_locs = ref_pts + raw_offsets / norm_wh                    # (B,Nq,H,L,P,2)
         samp_grid = 2.0 * samp_locs - 1.0                             # remap to [-1,1]
 
@@ -578,19 +594,19 @@ class MultiScaleDeformAttn(nn.Module):
         attn_w = F.softmax(attn_w, dim=-1).view(B, Nq, H, L, P)      # (B,Nq,H,L,P)
 
         # Sample each level then weighted-sum
-        level_sizes  = [h * w for h, w in spatial_shapes]
-        v_per_level  = v_proj.split(level_sizes, dim=1)
-        sampled_all  = []
+        level_sizes = [h * w for h, w in spatial_shapes]
+        v_per_level = v_proj.split(level_sizes, dim=1)
+        sampled_all = []
         for lid, (lh, lw) in enumerate(spatial_shapes):
-            feat_l  = v_per_level[lid].permute(0, 2, 3, 1).reshape(B * H, D, lh, lw)
-            grid_l  = samp_grid[:, :, :, lid, :, :].permute(0, 2, 1, 3, 4).reshape(B * H, Nq, P, 2)
-            samp_l  = F.grid_sample(feat_l, grid_l, mode="bilinear",
-                                    padding_mode="zeros", align_corners=False)  # (B*H,D,Nq,P)
+            feat_l = v_per_level[lid].permute(0, 2, 3, 1).reshape(B * H, D, lh, lw)
+            grid_l = samp_grid[:, :, :, lid, :, :].permute(0, 2, 1, 3, 4).reshape(B * H, Nq, P, 2)
+            samp_l = F.grid_sample(feat_l, grid_l, mode="bilinear",
+                                   padding_mode="zeros", align_corners=False)  # (B*H,D,Nq,P)
             sampled_all.append(samp_l)
 
         # Concat along last dim → (B*H, D, Nq, L*P)
         sampled_cat = torch.cat(sampled_all, dim=-1)
-        attn_flat   = attn_w.view(B, Nq, H, L * P).permute(0, 2, 1, 3).reshape(B * H, 1, Nq, L * P)
+        attn_flat = attn_w.view(B, Nq, H, L * P).permute(0, 2, 1, 3).reshape(B * H, 1, Nq, L * P)
         out = (sampled_cat * attn_flat).sum(dim=-1)                    # (B*H, D, Nq)
         out = out.view(B, H, D, Nq).permute(0, 3, 1, 2).reshape(B, Nq, self.d_model)
         return self.output_proj(out)
@@ -603,7 +619,11 @@ class DefEncLayer(nn.Module):
         self.self_attn = MultiScaleDeformAttn(d_model, n_heads, n_levels, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, d_ffn), nn.ReLU(inplace=True), nn.Dropout(dropout), nn.Linear(d_ffn, d_model))
+        self.ffn = nn.Sequential(
+            nn.Linear(
+                d_model, d_ffn), nn.ReLU(
+                inplace=True), nn.Dropout(dropout), nn.Linear(
+                d_ffn, d_model))
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -624,7 +644,11 @@ class DefDecLayer(nn.Module):
         self.cross_attn = MultiScaleDeformAttn(d_model, n_heads, n_levels, n_points)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, d_ffn), nn.ReLU(inplace=True), nn.Dropout(dropout), nn.Linear(d_ffn, d_model))
+        self.ffn = nn.Sequential(
+            nn.Linear(
+                d_model, d_ffn), nn.ReLU(
+                inplace=True), nn.Dropout(dropout), nn.Linear(
+                d_ffn, d_model))
         self.dropout3 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
@@ -759,7 +783,11 @@ class DigitDETR(nn.Module):
         # ---- DN embeddings ----
         self.label_enc = nn.Embedding(self.num_classes_with_bg, hidden_dim)
         self.box_enc = nn.Sequential(nn.Linear(4, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim))
-        self.dn_query_pos = nn.Sequential(nn.Linear(4, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim))
+        self.dn_query_pos = nn.Sequential(
+            nn.Linear(
+                4, hidden_dim), nn.ReLU(
+                inplace=True), nn.Linear(
+                hidden_dim, hidden_dim))
 
         # ---- Prediction heads ----
         self.class_heads = nn.ModuleList([nn.Linear(hidden_dim, self.num_classes_with_bg) for _ in range(dec_layers)])
@@ -789,7 +817,7 @@ class DigitDETR(nn.Module):
         if not self.training or not self.use_dn or targets is None:
             return None, None, None, None
         out = build_dn_queries(targets, self.num_classes, self.dn_number,
-                                     self.label_noise_ratio, self.box_noise_scale, device)
+                               self.label_noise_ratio, self.box_noise_scale, device)
         if out is None:
             return None, None, None, None
         dn_labels, dn_boxes, dn_meta = out
@@ -975,7 +1003,8 @@ class SetCriterion(nn.Module):
             src_boxes = torch.cat(src_boxes, dim=0)
             tgt_boxes = torch.cat(tgt_boxes, dim=0)
             loss_bbox = F.l1_loss(src_boxes, tgt_boxes, reduction="mean")
-            loss_giou = 1.0 - generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(tgt_boxes)).diag().mean()
+            loss_giou = 1.0 - generalized_box_iou(box_cxcywh_to_xyxy(src_boxes),
+                                                  box_cxcywh_to_xyxy(tgt_boxes)).diag().mean()
         else:
             loss_bbox = torch.tensor(0.0, device=device)
             loss_giou = torch.tensor(0.0, device=device)
@@ -1016,7 +1045,8 @@ class SetCriterion(nn.Module):
             loss_ce = sigmoid_focal_loss(src_logits, onehot, alpha=self.focal_alpha, gamma=self.focal_gamma)
 
         loss_bbox = F.l1_loss(src_boxes, tgt_boxes, reduction="mean")
-        loss_giou = 1.0 - generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(tgt_boxes)).diag().mean()
+        loss_giou = 1.0 - generalized_box_iou(box_cxcywh_to_xyxy(src_boxes),
+                                              box_cxcywh_to_xyxy(tgt_boxes)).diag().mean()
         total_dn = (self.w_ce * loss_ce + self.w_bbox * loss_bbox + self.w_giou * loss_giou) * self.dn_loss_coef
         return total_dn, float(total_dn.item())
 
@@ -1093,7 +1123,7 @@ def postprocess_single_image_predictions(
     keep_indices = []
     for cls in cls_ids.unique():
         cls_mask = cls_ids == cls
-        cls_idx  = cls_mask.nonzero(as_tuple=True)[0]
+        cls_idx = cls_mask.nonzero(as_tuple=True)[0]
         if use_soft_nms:
             ki = soft_nms(boxes_xyxy[cls_idx].float(), scores[cls_idx].float(),
                           sigma=0.5, score_thresh=score_thresh * 0.1)
@@ -1116,7 +1146,19 @@ def postprocess_single_image_predictions(
 
 # ===================== Evaluation =====================
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, img_size, output_dir, epoch, num_classes, val_score_thresh, nms_thresh, use_focal, use_soft_nms=True):
+def evaluate(
+        model,
+        loader,
+        criterion,
+        device,
+        img_size,
+        output_dir,
+        epoch,
+        num_classes,
+        val_score_thresh,
+        nms_thresh,
+        use_focal,
+        use_soft_nms=True):
     model.eval()
     total_loss = defaultdict(float)
     n_batches = 0
@@ -1227,19 +1269,30 @@ def plot_confusion_matrix(preds, gts, output_dir, epoch, num_classes):
 def plot_curves(history, output_dir):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes[0, 0].plot(history["train_loss"], label="Train Loss")
-    axes[0, 0].set_title("Train Loss"); axes[0, 0].grid(True); axes[0, 0].legend()
+    axes[0, 0].set_title("Train Loss")
+    axes[0, 0].grid(True)
+    axes[0, 0].legend()
     ep = [i for i, v in enumerate(history["val_loss"]) if v is not None]
     vl = [v for v in history["val_loss"] if v is not None]
-    if vl: axes[0, 1].plot(ep, vl, label="Val Loss", marker="o", markersize=3)
-    axes[0, 1].set_title("Val Loss"); axes[0, 1].grid(True); axes[0, 1].legend()
+    if vl:
+        axes[0, 1].plot(ep, vl, label="Val Loss", marker="o", markersize=3)
+    axes[0, 1].set_title("Val Loss")
+    axes[0, 1].grid(True)
+    axes[0, 1].legend()
     ea = [i for i, v in enumerate(history["val_acc"]) if v is not None]
     va = [v for v in history["val_acc"] if v is not None]
-    if va: axes[1, 0].plot(ea, va, label="Val Matched Acc", marker="o", markersize=3)
-    axes[1, 0].set_title("Val Matched Accuracy"); axes[1, 0].grid(True); axes[1, 0].legend()
+    if va:
+        axes[1, 0].plot(ea, va, label="Val Matched Acc", marker="o", markersize=3)
+    axes[1, 0].set_title("Val Matched Accuracy")
+    axes[1, 0].grid(True)
+    axes[1, 0].legend()
     em = [i for i, v in enumerate(history["val_mAP"]) if v is not None]
     vm = [v for v in history["val_mAP"] if v is not None]
-    if vm: axes[1, 1].plot(em, vm, label="Val mAP", marker="o", markersize=3)
-    axes[1, 1].set_title("Val mAP @[.5:.95]"); axes[1, 1].grid(True); axes[1, 1].legend()
+    if vm:
+        axes[1, 1].plot(em, vm, label="Val mAP", marker="o", markersize=3)
+    axes[1, 1].set_title("Val mAP @[.5:.95]")
+    axes[1, 1].grid(True)
+    axes[1, 1].legend()
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "curves.png"), dpi=150)
     plt.close(fig)
@@ -1296,9 +1349,9 @@ def inference(model, test_dir, img_size, device, score_thresh, nms_thresh,
     """
     model.eval()
     use_amp = device.type == "cuda"
-    ds      = TestDataset(test_dir, img_size)
-    dl      = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2,
-                         collate_fn=collate_fn_test, pin_memory=use_amp)
+    ds = TestDataset(test_dir, img_size)
+    dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2,
+                    collate_fn=collate_fn_test, pin_memory=use_amp)
 
     # --- Pass 1: forward, collect raw outputs ---
     raw_records = []
@@ -1307,11 +1360,11 @@ def inference(model, test_dir, img_size, device, score_thresh, nms_thresh,
         with get_autocast(device, enabled=use_amp):
             out = model(imgs)
         raw_records.append({
-            "img_id":  int(img_ids[0]),
-            "logits":  out["pred_logits"][0].detach().cpu(),
-            "boxes":   out["pred_boxes"][0].detach().cpu(),
-            "orig_h":  hs[0], "orig_w": ws[0],
-            "scale":   scales[0], "pl": pls[0], "pt": pts[0],
+            "img_id": int(img_ids[0]),
+            "logits": out["pred_logits"][0].detach().cpu(),
+            "boxes": out["pred_boxes"][0].detach().cpu(),
+            "orig_h": hs[0], "orig_w": ws[0],
+            "scale": scales[0], "pl": pls[0], "pt": pts[0],
         })
 
     # --- Pass 2: postprocess and build submission list ---
@@ -1326,10 +1379,10 @@ def inference(model, test_dir, img_size, device, score_thresh, nms_thresh,
         )
         for p in preds:
             submission.append({
-                "image_id":    rec["img_id"],
+                "image_id": rec["img_id"],
                 "category_id": p["category_id"],
-                "bbox":        [round(v, 2) for v in p["bbox"]],
-                "score":       round(p["score"], 6),
+                "bbox": [round(v, 2) for v in p["bbox"]],
+                "score": round(p["score"], 6),
             })
 
     with open(output_path, "w", encoding="utf-8") as fp:
@@ -1346,7 +1399,7 @@ def inference_tta(model, args, device):
     Typically adds +1~2 mAP over single-scale inference.
     """
     model.eval()
-    use_amp   = device.type == "cuda"
+    use_amp = device.type == "cuda"
     all_by_id = defaultdict(list)   # img_id → list of raw preds
 
     for img_size in args.tta_scales:
@@ -1361,12 +1414,16 @@ def inference_tta(model, args, device):
             sc, pl, pt = scales[0], pls[0], pts[0]
 
             logits = outputs["pred_logits"][0].detach().cpu()
-            boxes  = outputs["pred_boxes"][0].detach().cpu()
-            probs  = logits.sigmoid() if args.use_focal else logits.softmax(-1)
-            scores_, cls_ids_ = probs[:, 1:].max(-1); cls_ids_ = cls_ids_ + 1
+            boxes = outputs["pred_boxes"][0].detach().cpu()
+            probs = logits.sigmoid() if args.use_focal else logits.softmax(-1)
+            scores_, cls_ids_ = probs[:, 1:].max(-1)
+            cls_ids_ = cls_ids_ + 1
             keep = scores_ > args.score_thresh * 0.5   # lower thresh before merging
-            if not keep.any(): continue
-            scores_  = scores_[keep]; cls_ids_ = cls_ids_[keep]; boxes = boxes[keep]
+            if not keep.any():
+                continue
+            scores_ = scores_[keep]
+            cls_ids_ = cls_ids_[keep]
+            boxes = boxes[keep]
 
             boxes_xywh = convert_to_orig_coords(boxes, img_size, sc, pl, pt, orig_w, orig_h)
             boxes_xyxy = boxes_xywh.clone()
@@ -1377,9 +1434,9 @@ def inference_tta(model, args, device):
             for q in range(len(scores_)):
                 all_by_id[img_id].append({
                     "category_id": int(cls_ids_[q]),
-                    "score":       float(scores_[q]),
-                    "bbox":        boxes_xywh[q].tolist(),
-                    "bbox_xyxy":   boxes_xyxy[q].tolist(),
+                    "score": float(scores_[q]),
+                    "bbox": boxes_xywh[q].tolist(),
+                    "bbox_xyxy": boxes_xyxy[q].tolist(),
                 })
 
     # Per-image per-class Soft NMS to merge all scales
@@ -1388,13 +1445,13 @@ def inference_tta(model, args, device):
         for c in set(p["category_id"] for p in preds):
             cp = [p for p in preds if p["category_id"] == c]
             bx = torch.tensor([p["bbox_xyxy"] for p in cp])
-            sc = torch.tensor([p["score"]     for p in cp])
+            sc = torch.tensor([p["score"] for p in cp])
             ki = soft_nms(bx, sc, sigma=0.5, score_thresh=args.score_thresh)
             for k in ki.tolist():
                 results.append({
-                    "image_id":    int(img_id),
-                    "bbox":        [round(v, 2) for v in cp[k]["bbox"]],
-                    "score":       round(float(sc[k]), 6),
+                    "image_id": int(img_id),
+                    "bbox": [round(v, 2) for v in cp[k]["bbox"]],
+                    "score": round(float(sc[k]), 6),
                     "category_id": c,
                 })
 
@@ -1436,7 +1493,7 @@ def _restore_checkpoint(path, net, shadow, device):
     if "ema" in saved:
         shadow.ema.load_state_dict(saved["ema"])
     first_epoch = int(saved.get("epoch", -1)) + 1
-    top_mAP     = float(saved.get("best_mAP", 0.0))
+    top_mAP = float(saved.get("best_mAP", 0.0))
     run_history = saved.get("history",
                             {"train_loss": [], "val_loss": [], "val_acc": [], "val_mAP": []})
     return saved, first_epoch, top_mAP, run_history
@@ -1488,9 +1545,9 @@ def main():
     logger.info(f"Model params: {sum(p.numel() for p in net.parameters()):,}")
 
     first_epoch = 0
-    top_mAP     = 0.0
+    top_mAP = 0.0
     run_history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_mAP": []}
-    saved       = None
+    saved = None
 
     if args.resume:
         saved, first_epoch, top_mAP, run_history = _restore_checkpoint(
@@ -1503,8 +1560,8 @@ def main():
                                     args.img_size, is_train=True)
         if os.path.isdir(args.copypaste_img_dir) and os.path.isfile(args.copypaste_ann):
             from torch.utils.data import ConcatDataset
-            cp_ds    = CocoDigitDataset(args.copypaste_img_dir, args.copypaste_ann,
-                                        args.img_size, is_train=True)
+            cp_ds = CocoDigitDataset(args.copypaste_img_dir, args.copypaste_ann,
+                                     args.img_size, is_train=True)
             train_ds = ConcatDataset([train_ds, cp_ds])
             logger.info(f"train_copypaste merged -> total train: {len(train_ds)}")
         else:
@@ -1517,17 +1574,19 @@ def main():
 
         # ---- Optimizer / Scheduler ----
         param_groups = build_param_groups(net, args.lr, args.lr_backbone, args.backbone_lr_decay)
-        optim     = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+        optim = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
         scheduler = build_warmup_cosine_scheduler(optim, args.warmup_epochs, args.epochs, args.min_lr_ratio)
-        use_amp   = device.type == "cuda"
-        scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
+        use_amp = device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         if saved is not None:
-            if "optimizer" in saved: optim.load_state_dict(saved["optimizer"])
-            if "scheduler" in saved: scheduler.load_state_dict(saved["scheduler"])
+            if "optimizer" in saved:
+                optim.load_state_dict(saved["optimizer"])
+            if "scheduler" in saved:
+                scheduler.load_state_dict(saved["scheduler"])
 
         # ---- Criterion ----
-        matcher   = HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou)
+        matcher = HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou)
         criterion = SetCriterion(
             args.num_classes + 1, matcher,
             args.loss_ce, args.loss_bbox, args.loss_giou, args.eos_coef,
@@ -1540,12 +1599,12 @@ def main():
 
         # ---- Early stopping ----
         es_patience = args.early_stop_patience
-        es_counter  = 0
+        es_counter = 0
 
         for epoch in range(first_epoch, args.epochs):
             net.train()
             running_loss = 0.0
-            n_steps      = 0
+            n_steps = 0
             pbar = tqdm(tr_dl, desc=f"Epoch {epoch + 1}/{args.epochs}")
             for imgs, targets in pbar:
                 if args.use_mosaic:
@@ -1553,21 +1612,23 @@ def main():
                         list(zip(imgs, targets)), train_ds,
                         args.img_size, prob=args.mosaic_prob)
                     imgs = torch.stack(imgs) if not isinstance(imgs, torch.Tensor) else imgs
-                imgs    = imgs.to(device, non_blocking=True)
+                imgs = imgs.to(device, non_blocking=True)
                 targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
                             for k, v in t.items()} for t in targets]
                 optim.zero_grad(set_to_none=True)
                 with get_autocast(device, enabled=use_amp):
-                    out         = net(imgs, targets if args.use_dn else None)
+                    out = net(imgs, targets if args.use_dn else None)
                     loss, ld, _ = criterion(out, targets)
                 scaler.scale(loss).backward()
                 if args.clip_max_norm > 0:
                     scaler.unscale_(optim)
                     nn.utils.clip_grad_norm_(net.parameters(), args.clip_max_norm)
-                scaler.step(optim); scaler.update()
+                scaler.step(optim)
+                scaler.update()
                 shadow.update(net)
 
-                running_loss += ld["loss"]; n_steps += 1
+                running_loss += ld["loss"]
+                n_steps += 1
                 pbar.set_postfix(
                     loss=f"{ld['loss']:.4f}", ce=f"{ld['loss_ce']:.3f}",
                     bbox=f"{ld['loss_bbox']:.3f}", giou=f"{ld['loss_giou']:.3f}",
@@ -1604,7 +1665,7 @@ def main():
                     }, path)
 
                 if val_mAP > top_mAP:
-                    top_mAP    = val_mAP
+                    top_mAP = val_mAP
                     es_counter = 0
                     _save_ckpt(os.path.join(args.output_dir, "best.pth"))
                     logger.info(f"  ✓ New best mAP: {top_mAP:.4f} -> best.pth saved")
